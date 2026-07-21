@@ -60,44 +60,213 @@ class TestUIAssetsStandalone:
 # ---------------------------------------------------------------------------
 # Sample data
 # ---------------------------------------------------------------------------
+# builtin_imdb uses a small bundled fallback by default (no network call).
+# allow_download=True fetches a larger sample from IMDb instead. These
+# tests mock the network call so they run offline.
+_SAMPLE_TSV_BYTES = (
+    b"tconst\ttitleType\tprimaryTitle\toriginalTitle\tisAdult\tstartYear\t"
+    b"endYear\truntimeMinutes\tgenres\n"
+    b"tt0000001\tshort\tCarmencita\tCarmencita\t0\t1894\t\\N\t1\tDocumentary,Short\n"
+)
+
+
+def _make_fake_gzip_response(payload: bytes):
+    """Gzip-compress `payload`, mimicking the IMDb .gz response body."""
+    import gzip
+    import io
+
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+        gz.write(payload)
+    return buf.getvalue()
+
+
 class TestSampleDataStandalone:
-    """Verify IMDB sample data is bundled and samples.py finds it locally."""
+    """builtin_imdb uses a small bundled fallback by default and only
+    fetches a larger sample when explicitly requested."""
 
-    IMDB_TSV = _SCRIPTS_DIR / "sample_data" / "imdb.title.basics.tsv"
+    def test_fallback_sample_is_bundled(self):
+        from lib import samples
 
-    def test_sample_data_directory_exists(self):
-        assert (_SCRIPTS_DIR / "sample_data").is_dir()
+        fallback_path = _SCRIPTS_DIR / "sample_data" / samples._IMDB_FALLBACK_FILENAME
+        assert fallback_path.is_file(), f"Bundled fallback sample missing: {fallback_path}"
+        assert fallback_path.stat().st_size < 10_000, (
+            "Bundled fallback sample should be small (~20 rows), not a full dataset dump"
+        )
 
-    def test_imdb_tsv_exists(self):
-        assert self.IMDB_TSV.is_file(), f"IMDB TSV missing: {self.IMDB_TSV}"
+    def test_full_sample_not_bundled(self):
+        from lib import samples
 
-    def test_imdb_tsv_not_empty(self):
-        assert self.IMDB_TSV.stat().st_size > 0
+        full_path = _SCRIPTS_DIR / "sample_data" / samples._IMDB_SAMPLE_FILENAME
+        assert not full_path.exists(), (
+            "Full-size IMDB sample should not be bundled; only the small fallback should ship"
+        )
 
-    def test_imdb_tsv_has_header_row(self):
-        with open(self.IMDB_TSV, "r") as f:
-            header = f.readline().strip()
-        assert "tconst" in header, f"Unexpected header: {header}"
-
-    def test_load_sample_builtin_imdb_succeeds(self):
+    def test_load_sample_builtin_imdb_default_uses_bundled_fallback_offline(self, monkeypatch):
         import json
-        from lib.samples import load_sample_builtin_imdb
 
-        result = json.loads(load_sample_builtin_imdb())
+        from lib import samples
+
+        def _fail(*args, **kwargs):
+            raise AssertionError("Should not attempt network access without allow_download=True")
+
+        monkeypatch.setattr(samples, "_download_imdb_sample", _fail)
+        monkeypatch.setattr(samples, "_build_safe_opener", _fail)
+
+        result = json.loads(samples.load_sample_builtin_imdb())
         assert "error" not in result, f"load_sample_builtin_imdb failed: {result}"
         assert result["status"] == "loaded"
         assert result["record_count"] > 0
 
-    def test_builtin_imdb_resolves_to_local_path(self):
+    def test_load_sample_builtin_imdb_downloads_and_caches(self, monkeypatch, tmp_path):
+        import io
         import json
-        from lib.samples import load_sample_builtin_imdb
 
-        result = json.loads(load_sample_builtin_imdb())
-        source = result.get("source", "")
-        # Must resolve inside the skill, not opensearch_orchestrator/
-        assert "opensearch_orchestrator" not in source, (
-            f"IMDB sample resolved outside the skill: {source}"
+        from lib import samples
+
+        cache_dir = tmp_path / "cache"
+        monkeypatch.setattr(samples, "_imdb_cache_dir", lambda: cache_dir)
+
+        gz_bytes = _make_fake_gzip_response(_SAMPLE_TSV_BYTES)
+
+        class _FakeOpener:
+            def open(self, req, timeout=None):
+                return io.BytesIO(gz_bytes)
+
+        monkeypatch.setattr(samples, "_validate_url", lambda url: None)
+        monkeypatch.setattr(samples, "_build_safe_opener", lambda: _FakeOpener())
+
+        result = json.loads(samples.load_sample_builtin_imdb(allow_download=True))
+        assert "error" not in result, f"load_sample_builtin_imdb failed: {result}"
+        assert result["status"] == "loaded"
+        assert result["record_count"] > 0
+
+        cached_file = cache_dir / samples._IMDB_SAMPLE_FILENAME
+        assert cached_file.is_file(), "Downloaded sample should be cached to disk"
+
+    def test_load_sample_builtin_imdb_uses_cache_without_reopening_network(
+        self, monkeypatch, tmp_path
+    ):
+        import json
+
+        from lib import samples
+
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir(parents=True)
+        cached_file = cache_dir / samples._IMDB_SAMPLE_FILENAME
+        cached_file.write_text(_SAMPLE_TSV_BYTES.decode("utf-8"))
+
+        monkeypatch.setattr(samples, "_imdb_cache_dir", lambda: cache_dir)
+
+        def _fail_download(dest):
+            raise AssertionError("Should not attempt download when cache exists")
+
+        monkeypatch.setattr(samples, "_download_imdb_sample", _fail_download)
+
+        result = json.loads(samples.load_sample_builtin_imdb(allow_download=True))
+        assert "error" not in result, f"load_sample_builtin_imdb failed: {result}"
+        assert result["status"] == "loaded"
+
+    def test_load_sample_builtin_imdb_surfaces_download_errors(self, monkeypatch, tmp_path):
+        import json
+
+        from lib import samples
+
+        cache_dir = tmp_path / "cache"
+        monkeypatch.setattr(samples, "_imdb_cache_dir", lambda: cache_dir)
+
+        def _raise(dest):
+            raise OSError("network unreachable")
+
+        monkeypatch.setattr(samples, "_download_imdb_sample", _raise)
+
+        result = json.loads(samples.load_sample_builtin_imdb(allow_download=True))
+        assert "error" in result
+
+    def test_download_rejects_unexpected_schema(self, monkeypatch, tmp_path):
+        import io
+
+        from lib import samples
+
+        cache_dir = tmp_path / "cache"
+        bogus_payload = b"not\tthe\texpected\theader\n1\t2\t3\t4\n"
+        gz_bytes = _make_fake_gzip_response(bogus_payload)
+
+        class _FakeOpener:
+            def open(self, req, timeout=None):
+                return io.BytesIO(gz_bytes)
+
+        monkeypatch.setattr(samples, "_validate_url", lambda url: None)
+        monkeypatch.setattr(samples, "_build_safe_opener", lambda: _FakeOpener())
+
+        dest = cache_dir / samples._IMDB_SAMPLE_FILENAME
+        with pytest.raises(ValueError, match="Unexpected sample data format"):
+            samples._download_imdb_sample(dest)
+
+        assert not dest.exists(), "Rejected download should not be written to the cache path"
+        assert not dest.with_suffix(dest.suffix + ".part").exists(), (
+            "Temp file should be cleaned up after a failed validation"
         )
+
+    def test_download_stops_early_without_reading_full_response(self, monkeypatch, tmp_path):
+        """IMDb's full catalog is 200MB+ compressed; the download should
+        stop once enough rows are read rather than consuming it all."""
+        import io
+
+        from lib import samples
+
+        cache_dir = tmp_path / "cache"
+
+        header = b"tconst\ttitleType\tprimaryTitle\toriginalTitle\tisAdult\tstartYear\tendYear\truntimeMinutes\tgenres\n"
+        row = b"tt0000001\tshort\tCarmencita\tCarmencita\t0\t1894\t\\N\t1\tDocumentary,Short\n"
+        many_rows = header + row * (samples._IMDB_SAMPLE_MAX_ROWS * 3)
+        gz_bytes = _make_fake_gzip_response(many_rows)
+
+        class _FakeOpener:
+            def open(self, req, timeout=None):
+                return io.BytesIO(gz_bytes)
+
+        monkeypatch.setattr(samples, "_validate_url", lambda url: None)
+        monkeypatch.setattr(samples, "_build_safe_opener", lambda: _FakeOpener())
+
+        dest = cache_dir / samples._IMDB_SAMPLE_FILENAME
+        samples._download_imdb_sample(dest)
+
+        assert dest.is_file()
+        with open(dest) as f:
+            line_count = sum(1 for _ in f)
+        assert line_count <= samples._IMDB_SAMPLE_MAX_ROWS + 1  # header + N rows, not 3x
+
+    def test_download_rejects_oversized_line(self, monkeypatch, tmp_path):
+        """Guards against a malformed/malicious response with no newlines
+        that would otherwise buffer unbounded data."""
+        import io
+
+        from lib import samples
+
+        cache_dir = tmp_path / "cache"
+        header = b"tconst\ttitleType\tprimaryTitle\toriginalTitle\tisAdult\tstartYear\tendYear\truntimeMinutes\tgenres\n"
+        huge_line = b"tt0000001\t" + b"a" * (2 * 1024 * 1024) + b"\n"  # 2MB, over the 1MB cap
+        gz_bytes = _make_fake_gzip_response(header + huge_line)
+
+        class _FakeOpener:
+            def open(self, req, timeout=None):
+                return io.BytesIO(gz_bytes)
+
+        monkeypatch.setattr(samples, "_validate_url", lambda url: None)
+        monkeypatch.setattr(samples, "_build_safe_opener", lambda: _FakeOpener())
+
+        dest = cache_dir / samples._IMDB_SAMPLE_FILENAME
+        with pytest.raises(ValueError, match="exceeded the expected size"):
+            samples._download_imdb_sample(dest)
+
+        assert not dest.exists()
+
+    def test_download_url_is_https(self):
+        from lib import samples
+        from urllib.parse import urlparse
+
+        assert urlparse(samples._IMDB_SAMPLE_URL).scheme == "https"
 
 
 # ---------------------------------------------------------------------------
@@ -115,9 +284,9 @@ class TestResolvedPathsAreRelative:
             f"SEARCH_UI_STATIC_DIR escapes the scripts dir: {resolved}"
         )
 
-    def test_samples_imdb_candidates_are_under_skill_root(self):
-        """Check that the candidate paths in load_sample_builtin_imdb
-        stay within the skill tree."""
+    def test_samples_imdb_resolution_has_no_repo_root_assumptions(self):
+        """Check that load_sample_builtin_imdb's bundled-path fallback and
+        cache-dir logic never hardcode a path outside the skill/user cache."""
         import inspect
         from lib.samples import load_sample_builtin_imdb
 

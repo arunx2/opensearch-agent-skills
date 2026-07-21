@@ -68,17 +68,107 @@ def _infer_text_fields(doc: dict) -> list[str]:
     return text_fields
 
 
-def load_sample_builtin_imdb() -> str:
-    script_dir = Path(__file__).resolve().parent.parent
-    # Look for bundled sample data alongside this script
-    candidates = [
-        script_dir / "sample_data" / "imdb.title.basics.tsv",
-    ]
-    for path in candidates:
-        if path.exists():
-            return load_sample_from_file(str(path.resolve()))
+# IMDb's non-commercial dataset export: https://developer.imdb.com/non-commercial-datasets/
+_IMDB_SAMPLE_URL = "https://datasets.imdbws.com/title.basics.tsv.gz"
+_IMDB_SAMPLE_FILENAME = "imdb.title.basics.tsv"
+_IMDB_SAMPLE_MAX_ROWS = 100_000  # cap applied when the full sample is downloaded
 
-    return json.dumps({"error": "IMDB sample data not found."})
+# Small (20-title) fallback bundled with the skill so builtin_imdb works
+# offline by default. Pass allow_download=True to fetch from IMDb instead.
+_IMDB_FALLBACK_FILENAME = "imdb.title.basics.sample20.tsv"
+
+
+def _imdb_cache_dir() -> Path:
+    """Local cache directory for downloaded sample data.
+
+    Respects XDG_CACHE_HOME when set, otherwise defaults to ~/.cache."""
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg_cache) if xdg_cache else Path.home() / ".cache"
+    return base / "opensearch-agent-skills" / "sample_data"
+
+
+def _download_imdb_sample(dest: Path) -> None:
+    """Download IMDb's title.basics.tsv.gz and write the first
+    _IMDB_SAMPLE_MAX_ROWS rows to `dest`.
+
+    Stops reading once enough rows are collected, so only a small part of
+    the (200MB+) source file is actually downloaded. Requires HTTPS and
+    checks the decompressed header matches the expected TSV schema.
+    """
+    import gzip
+
+    parsed = urlparse(_IMDB_SAMPLE_URL)
+    if parsed.scheme != "https":
+        raise ValueError(f"Refusing to fetch sample data over non-HTTPS URL: {_IMDB_SAMPLE_URL}")
+    _validate_url(_IMDB_SAMPLE_URL)
+
+    req = urllib.request.Request(
+        _IMDB_SAMPLE_URL, headers={"User-Agent": "opensearch-skills/1.0"}
+    )
+    opener = _build_safe_opener()
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dest.with_suffix(dest.suffix + ".part")
+    max_line_bytes = 1024 * 1024  # 1MB; real rows are well under 1KB
+
+    try:
+        with opener.open(req, timeout=60) as resp:
+            with gzip.GzipFile(fileobj=resp) as gz, open(
+                tmp_path, "w", encoding="utf-8", newline=""
+            ) as out:
+                for i, raw_line in enumerate(gz):
+                    if len(raw_line) > max_line_bytes:
+                        raise ValueError(
+                            "Sample data line exceeded the expected size; "
+                            "response does not look like valid TSV"
+                        )
+                    line = raw_line.decode("utf-8", errors="replace")
+                    if i == 0 and not line.startswith("tconst\t"):
+                        raise ValueError(
+                            "Unexpected sample data format: header does not "
+                            "match IMDb title.basics.tsv schema"
+                        )
+                    if i > _IMDB_SAMPLE_MAX_ROWS:  # header + N data rows
+                        break
+                    out.write(line)
+        tmp_path.replace(dest)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def load_sample_builtin_imdb(allow_download: bool = False) -> str:
+    """Load the built-in IMDB sample dataset.
+
+    By default uses a small bundled fallback (no network call). Pass
+    allow_download=True to fetch a larger sample from IMDb instead,
+    caching it locally for reuse.
+    """
+    script_dir = Path(__file__).resolve().parent.parent
+
+    if not allow_download:
+        fallback_path = script_dir / "sample_data" / _IMDB_FALLBACK_FILENAME
+        if fallback_path.exists():
+            return load_sample_from_file(str(fallback_path.resolve()))
+        return json.dumps({
+            "error": (
+                "Bundled IMDB sample not found. Retry with allow_download=True "
+                "to fetch a larger sample from IMDb's dataset export."
+            )
+        })
+
+    cached_path = _imdb_cache_dir() / _IMDB_SAMPLE_FILENAME
+    if cached_path.exists():
+        return load_sample_from_file(str(cached_path.resolve()))
+
+    try:
+        _download_imdb_sample(cached_path)
+    except Exception as e:
+        return json.dumps({
+            "error": f"IMDB sample data not found locally and download failed: {e}"
+        })
+
+    return load_sample_from_file(str(cached_path.resolve()))
 
 
 def load_sample_from_file(file_path: str) -> str:
