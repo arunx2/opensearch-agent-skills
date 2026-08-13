@@ -272,6 +272,22 @@ def test_write_then_read_status_roundtrip(workdir):
     assert status["stage"] == "processing"
 
 
+def test_write_status_replaces_existing_file_on_windows(workdir, monkeypatch):
+    write_status({"active": True, "stage": "processing"})
+    original_rename = Path.rename
+
+    def windows_rename(source, target):
+        if Path(target).exists():
+            raise FileExistsError(target)
+        return original_rename(source, target)
+
+    monkeypatch.setattr(Path, "rename", windows_rename)
+
+    write_status({"active": False, "stage": "complete"})
+
+    assert read_status() == {"active": False, "stage": "complete"}
+
+
 # ---------------------------------------------------------------------------
 # ingest_local  (named index, auto-derived when absent)
 # ---------------------------------------------------------------------------

@@ -512,11 +512,11 @@ def _status_path() -> Path:
 
 
 def write_status(data: dict):
-    """Write ingestion status for UI polling. Uses atomic write (temp + rename)."""
+    """Write ingestion status for UI polling. Uses an atomic replacement."""
     path = _status_path()
     tmp_path = path.with_suffix(".tmp")
     tmp_path.write_text(json.dumps(data, indent=2))
-    tmp_path.rename(path)
+    tmp_path.replace(path)
 
 
 def read_status() -> dict:
@@ -896,4 +896,3 @@ def ingest_local(
         "next_step": next_step,
         "visualize": f"launch-ui --mode ingestion --index {index_name}",
     }
-
