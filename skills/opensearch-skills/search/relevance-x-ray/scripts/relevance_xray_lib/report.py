@@ -1,4 +1,4 @@
-"""Format Relevance X-Ray findings into the fixed human-readable diagnosis
+"""Render findings in the fixed human-readable Relevance X-Ray diagnosis
 schema described in SKILL.md's "Output Format" section:
 
   1. Supported conclusion or abstention
@@ -12,14 +12,21 @@ testable.
 
 from __future__ import annotations
 
-from lib.explain_parser import ExplainSummary, to_plain_english
-from lib.rules_engine import Finding
+from .explain_parser import ExplainSummary, to_plain_english
+from .rules_engine import Finding
 
 _SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+_CONFIDENCE_ORDER = {"high": 0, "medium": 1, "low": 2}
 
 
 def _sorted_findings(findings: list[Finding]) -> list[Finding]:
-    return sorted(findings, key=lambda f: _SEVERITY_ORDER.get(f.severity, 99))
+    return sorted(
+        findings,
+        key=lambda f: (
+            _SEVERITY_ORDER.get(f.severity, 99),
+            _CONFIDENCE_ORDER.get(f.confidence, 99),
+        ),
+    )
 
 
 def build_diagnosis_report(
@@ -31,6 +38,7 @@ def build_diagnosis_report(
     validation: dict | None = None,
     search_context: dict | None = None,
     evaluated_rules: list[str] | None = None,
+    skipped_rules: dict[str, str] | None = None,
     limitations: list[str] | None = None,
     leg_summaries: dict[str, ExplainSummary] | None = None,
 ) -> str:
@@ -93,6 +101,8 @@ def build_diagnosis_report(
         lines.append(f"  Evaluated rules: {', '.join(evaluated_rules)}")
     else:
         lines.append("  No diagnostic rule had sufficient evidence to run.")
+    for rule, reason in (skipped_rules or {}).items():
+        lines.append(f"  Skipped rule: {rule} ({reason}).")
     for limitation in limitations or []:
         lines.append(f"  Limitation: {limitation}")
     lines.append("")
@@ -122,7 +132,7 @@ def build_diagnosis_report(
         candidate = validation.get("candidate")
         query_term = validation.get("query_term")
         lines.append(
-            f"  Adding synonym '{query_term}' -> '{candidate}': "
+            f"  OR-expanding '{query_term}' with '{candidate}': "
             f"rank {before_rank if before_rank is not None else 'not in top-k'} -> "
             f"{after_rank if after_rank is not None else 'not in top-k'} "
             f"({'improved' if validation.get('improved') else 'no improvement'})"

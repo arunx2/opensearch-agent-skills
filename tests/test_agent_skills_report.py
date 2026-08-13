@@ -1,14 +1,21 @@
-"""Tests for skills/opensearch-skills/scripts/lib/report.py"""
+"""Tests for the bundled Relevance X-Ray report formatter."""
 
 import sys
 from pathlib import Path
 
-_SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "opensearch-skills" / "scripts"
+_SCRIPTS_DIR = (
+    Path(__file__).resolve().parents[1]
+    / "skills"
+    / "opensearch-skills"
+    / "search"
+    / "relevance-x-ray"
+    / "scripts"
+)
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from lib.explain_parser import parse_explain
-from lib.report import build_diagnosis_report, build_findings_table
-from lib.rules_engine import Finding
+from relevance_xray_lib.explain_parser import parse_explain
+from relevance_xray_lib.report import build_diagnosis_report, build_findings_table
+from relevance_xray_lib.rules_engine import Finding
 
 
 def test_build_diagnosis_report_no_findings_matched():
@@ -49,6 +56,30 @@ def test_build_diagnosis_report_includes_findings_sorted_by_severity():
     assert "high issue" in report.split("EVIDENCE")[0]
     assert "fix high" in report
     assert "fix low" in report
+
+
+def test_report_prefers_higher_confidence_when_severity_matches():
+    summary = parse_explain({"value": 0.1, "description": "sum of:", "details": []})
+    findings = [
+        Finding(
+            rule="medium-confidence",
+            tag="[QUERY_TUNING]",
+            severity="MEDIUM",
+            confidence="medium",
+            message="medium confidence issue",
+            fix="fix medium",
+        ),
+        Finding(
+            rule="high-confidence",
+            tag="[INDEX_MAPPING]",
+            severity="MEDIUM",
+            confidence="high",
+            message="high confidence issue",
+            fix="fix high",
+        ),
+    ]
+    report = build_diagnosis_report("products", "q", "42", summary, findings=findings)
+    assert "high confidence issue" in report.split("EVIDENCE")[0]
 
 
 def test_build_diagnosis_report_includes_hybrid_breakdown():
@@ -110,7 +141,9 @@ def test_report_distinguishes_evaluated_rules_and_limitations():
         summary,
         findings=[],
         evaluated_rules=["analyzer_mismatch"],
+        skipped_rules={"weak_knn_recall": "no controlled counterfactual"},
         limitations=["hybrid normalization unavailable"],
     )
     assert "Evaluated rules: analyzer_mismatch" in report
+    assert "Skipped rule: weak_knn_recall (no controlled counterfactual)." in report
     assert "Limitation: hybrid normalization unavailable" in report

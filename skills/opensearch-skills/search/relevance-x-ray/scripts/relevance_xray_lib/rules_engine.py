@@ -1,7 +1,7 @@
-"""Anti-pattern detection rules for Relevance X-Ray.
+"""Evidence-gated anti-pattern rules bundled with Relevance X-Ray.
 
 Each rule takes the index mapping/settings, the query, and the parsed
-:class:`~lib.explain_parser.ExplainSummary` for a document, and returns zero
+:class:`~relevance_xray_lib.explain_parser.ExplainSummary` for a document, and returns zero
 or more :class:`Finding` objects. Rules are pure functions over plain data
 structures — no OpenSearch client calls here — so they are fully unit
 testable with fixture JSON.
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from lib.explain_parser import ExplainSummary
+from .explain_parser import ExplainSummary
 
 
 @dataclass
@@ -41,6 +41,10 @@ def _text_fields_without_keyword(mapping_properties: dict) -> set[str]:
         if not isinstance(spec, dict):
             continue
         if spec.get("type") == "text":
+            parent_name = name.rsplit(".", 1)[0] if "." in name else ""
+            parent_spec = (mapping_properties or {}).get(parent_name)
+            if isinstance(parent_spec, dict) and parent_spec.get("type") == "keyword":
+                continue
             fields = spec.get("fields") or {}
             has_keyword = any(
                 isinstance(f, dict) and f.get("type") == "keyword" for f in fields.values()
@@ -90,9 +94,9 @@ def check_analyzer_mismatch(analysis_by_field: dict) -> list[Finding]:
     """
     findings: list[Finding] = []
     for fld, evidence in (analysis_by_field or {}).items():
-        search_tokens = {str(t).lower() for t in evidence.get("search_tokens", [])}
-        index_tokens = {str(t).lower() for t in evidence.get("index_tokens", [])}
-        target_tokens = {str(t).lower() for t in evidence.get("target_tokens", [])}
+        search_tokens = {str(t) for t in evidence.get("search_tokens", [])}
+        index_tokens = {str(t) for t in evidence.get("index_tokens", [])}
+        target_tokens = {str(t) for t in evidence.get("target_tokens", [])}
         if not search_tokens or not index_tokens or not target_tokens:
             continue
         if search_tokens & target_tokens:
@@ -223,6 +227,17 @@ def check_knn_counterfactual(counterfactual: dict) -> list[Finding]:
         return []
     before_params = counterfactual.get("before_params", {})
     after_params = counterfactual.get("after_params", {})
+    if not before_params or set(before_params) != set(after_params):
+        return []
+    if any(not key.endswith(".ef_search") for key in before_params):
+        return []
+    if any(
+        not isinstance(before_params[key], (int, float))
+        or not isinstance(after_params[key], (int, float))
+        or after_params[key] <= before_params[key]
+        for key in before_params
+    ):
+        return []
     return [
         Finding(
             rule="weak_knn_recall",
@@ -279,22 +294,75 @@ def check_hybrid_leg_imbalance(
     return findings
 
 
-def evaluated_rule_names(context: dict) -> list[str]:
-    """Return only rules for which the context contains sufficient evidence."""
+def _has_complete_analyzer_evidence(analysis_by_field: dict) -> bool:
+    return any(
+        evidence.get("search_tokens")
+        and evidence.get("index_tokens")
+        and evidence.get("target_tokens")
+        for evidence in (analysis_by_field or {}).values()
+    )
+
+
+def rule_coverage(context: dict) -> tuple[list[str], dict[str, str]]:
+    """Return evaluated rules and an explicit reason for every skipped rule."""
     evaluated: list[str] = []
+    skipped: dict[str, str] = {}
     if context.get("mapping_properties") is not None and context.get("filter_or_exact_fields"):
         evaluated.append("missing_keyword_subfield")
-    if context.get("analysis_by_field"):
+    else:
+        skipped["missing_keyword_subfield"] = (
+            "the query contained no term/terms exact-match clause"
+            if context.get("mapping_properties") is not None
+            else "index mapping evidence was unavailable"
+        )
+    if _has_complete_analyzer_evidence(context.get("analysis_by_field") or {}):
         evaluated.append("analyzer_mismatch")
-    if context.get("referenced_fields") and context.get("mapping_properties") is not None:
+    else:
+        skipped["analyzer_mismatch"] = (
+            "no field had complete index-token, search-token, and target-term-vector evidence"
+        )
+    if (
+        context.get("referenced_fields")
+        and context.get("mapping_properties") is not None
+    ):
         evaluated.append("unindexed_scoring_field")
-    if context.get("query_terms") and context.get("summary") and context.get("co_occurring_terms"):
+    else:
+        skipped["unindexed_scoring_field"] = (
+            "the query contained no scoring field reference"
+            if context.get("mapping_properties") is not None
+            else "index mapping evidence was unavailable"
+        )
+    if (
+        context.get("query_terms")
+        and context.get("summary")
+        and context.get("co_occurring_terms") is not None
+    ):
         evaluated.append("vocabulary_mismatch")
-    if context.get("knn_counterfactual"):
+    else:
+        skipped["vocabulary_mismatch"] = (
+            "no corpus association evidence was collected; run suggest-synonyms"
+        )
+    if context.get("knn_counterfactual") is not None:
         evaluated.append("weak_knn_recall")
-    if context.get("hybrid_normalized_contributions") and context.get("hybrid_weights"):
+    else:
+        skipped["weak_knn_recall"] = (
+            "no controlled ef_search counterfactual was available"
+        )
+    if (
+        context.get("hybrid_normalized_contributions") is not None
+        and context.get("hybrid_weights") is not None
+    ):
         evaluated.append("hybrid_leg_imbalance")
-    return evaluated
+    else:
+        skipped["hybrid_leg_imbalance"] = (
+            "normalized per-leg contributions and configured weights were unavailable"
+        )
+    return evaluated, skipped
+
+
+def evaluated_rule_names(context: dict) -> list[str]:
+    """Return only rules for which the context contains sufficient evidence."""
+    return rule_coverage(context)[0]
 
 
 def run_all_rules(context: dict) -> list[Finding]:
@@ -313,7 +381,7 @@ def run_all_rules(context: dict) -> list[Finding]:
             context["mapping_properties"], context["filter_or_exact_fields"]
         )
 
-    if context.get("analysis_by_field"):
+    if _has_complete_analyzer_evidence(context.get("analysis_by_field") or {}):
         findings += check_analyzer_mismatch(context["analysis_by_field"])
 
     if context.get("referenced_fields") and context.get("mapping_properties") is not None:
@@ -321,15 +389,22 @@ def run_all_rules(context: dict) -> list[Finding]:
             context["referenced_fields"], context["mapping_properties"]
         )
 
-    if context.get("query_terms") and context.get("summary") and context.get("co_occurring_terms"):
+    if (
+        context.get("query_terms")
+        and context.get("summary")
+        and context.get("co_occurring_terms") is not None
+    ):
         findings += check_vocabulary_mismatch(
             context["query_terms"], context["summary"], context["co_occurring_terms"]
         )
 
-    if context.get("knn_counterfactual"):
+    if context.get("knn_counterfactual") is not None:
         findings += check_knn_counterfactual(context["knn_counterfactual"])
 
-    if context.get("hybrid_normalized_contributions") and context.get("hybrid_weights"):
+    if (
+        context.get("hybrid_normalized_contributions") is not None
+        and context.get("hybrid_weights") is not None
+    ):
         findings += check_hybrid_leg_imbalance(
             context["hybrid_normalized_contributions"],
             context["hybrid_weights"],

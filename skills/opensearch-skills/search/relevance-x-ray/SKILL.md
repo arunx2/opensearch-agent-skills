@@ -34,9 +34,9 @@ about (e.g., "why didn't 'wireless charger' return this product in the top
 ## Prerequisites
 
 - `uv` installed
-- A reachable OpenSearch cluster. Reuse the connection helpers in
-  `../../scripts/lib/client.py`; do not open a separate connection path or
-  call the helper that auto-bootstraps Docker.
+- A reachable OpenSearch cluster. Use the read-only connection helpers bundled
+  in `scripts/relevance_xray_lib/client.py`; they never bootstrap Docker and
+  never send credentials over remote plaintext HTTP.
 
 ## Critical Rules (MUST follow)
 
@@ -60,7 +60,7 @@ about (e.g., "why didn't 'wireless charger' return this product in the top
    scores separately, but never compare them with pipeline weights unless
    normalized per-leg contributions for the same result set are available.
 7. **Require counterfactual evidence** — diagnose k-NN recall or recommend a
-   synonym only when a controlled rerun improves the target rank.
+   vocabulary experiment only when a controlled rerun improves the target rank.
 
 ## Inputs Needed
 
@@ -74,6 +74,13 @@ If the user only gives a query with no target document, run the query and
 ask which result they want explained.
 
 ## Workflow
+
+For a disposable OpenSearch 3.8.0 environment with deterministic fixtures,
+read [demo-playbook.md](demo-playbook.md). Use its automated test before
+changing parser, rule, synonym, k-NN, or hybrid behavior.
+
+Run the commands below from this skill directory so the bundled `scripts/`
+paths resolve for both standalone and full-tree installations.
 
 ### Step 1 — Preflight and fetch context
 
@@ -114,13 +121,13 @@ established and name the missing evidence.
 Only a supported finding should end with a concrete suggestion:
 - A mapping/analyzer change (show the exact `PUT` body)
 - A boost adjustment
-- A candidate synonym pair (see Step 5)
-- A k-NN parameter candidate validated by the command's parameter sweep
+- A candidate vocabulary expansion (see Step 5)
+- An `ef_search` candidate validated while holding `k` constant
 
 When no finding is supported, recommend the next evidence-gathering action
 instead of changing production configuration.
 
-### Step 5 — Synonym suggestions (optional, on request or when a vocabulary gap is detected)
+### Step 5 — Vocabulary suggestions (optional, on request or when a vocabulary gap is detected)
 
 When the query term is absent from the target but the user suspects a
 vocabulary gap, run:
@@ -130,17 +137,18 @@ uv run python scripts/relevance_x_ray.py suggest-synonyms \
   --index <index> --query-term <term> --doc-id <id>
 ```
 
-This analyzes sampled source fields with their configured field analyzers,
-counts support once per document, restricts candidates to terms present in
-the target, and runs a non-mutating `multi_match(operator=or)` query
-expansion. Recommend only candidates that improve the target's measured
-top-k rank. Report the sample size, support, association, validation query
-shape, and rank delta. Treat this as evidence for a candidate experiment,
-not proof that two terms are semantically equivalent.
+This takes a reproducible randomized document sample, fetches its generated
+term vectors in one bounded batch, counts support once per document, restricts
+candidates to terms present in the target, and runs a non-mutating
+`multi_match(operator=or)` query expansion. Recommend only candidates that
+improve the target's measured top-k rank. Report the sample size, support,
+association, validation query shape, and rank delta. Treat this as evidence
+for a candidate experiment, not proof that two terms are semantically
+equivalent or that a production synonym analyzer will rank identically.
 
 ## Diagnosis Rules
 
-`lib/rules_engine.py` evaluates a rule only when its required evidence is
+`scripts/relevance_xray_lib/rules_engine.py` evaluates a rule only when its required evidence is
 available and reports which rules were skipped. Tags mirror
 `opensearch-launchpad`'s finding-tag vocabulary where applicable.
 
@@ -150,7 +158,7 @@ available and reports which rules were skipped. Tags mirror
 | Analyzer mismatch | Actual search-analyzer tokens miss the target while index-analyzer tokens overlap its term vectors | `[INDEX_MAPPING]` | Align analyzers and re-run the same ranking query |
 | Unavailable scoring field | A script/function field is absent or has `doc_values: false`; `index: false` alone is not an error | `[QUERY_TUNING]` | Fix the reference or enable the required value source |
 | Vocabulary candidate | A target term has document-level corpus association with the query term and improves rank under query expansion | `[QUERY_TUNING]` | Evaluate a search-time synonym on a broader judged query set |
-| Weak k-NN recall | The target rank improves in a controlled higher-`k`/`ef_search` rerun | `[MODEL_SELECTION]` | Evaluate the measured parameter candidate against latency and aggregate relevance |
+| Weak k-NN recall | The target rank improves when only explicit `ef_search` is increased and `k` remains fixed | `[MODEL_SELECTION]` | Evaluate the measured parameter candidate against latency and aggregate relevance |
 | Hybrid inert leg | A nonzero-weight leg has zero measured normalized contribution across inspected results | `[SEARCH_PIPELINE]` | Inspect the leg and normalization bounds; do not infer this from raw-score ratios |
 
 ## Output Format

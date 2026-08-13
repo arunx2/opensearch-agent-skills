@@ -1,13 +1,20 @@
-"""Tests for skills/opensearch-skills/scripts/lib/rules_engine.py"""
+"""Tests for the bundled Relevance X-Ray rules engine."""
 
 import sys
 from pathlib import Path
 
-_SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "opensearch-skills" / "scripts"
+_SCRIPTS_DIR = (
+    Path(__file__).resolve().parents[1]
+    / "skills"
+    / "opensearch-skills"
+    / "search"
+    / "relevance-x-ray"
+    / "scripts"
+)
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from lib.explain_parser import parse_explain
-from lib.rules_engine import (
+from relevance_xray_lib.explain_parser import parse_explain
+from relevance_xray_lib.rules_engine import (
     check_analyzer_mismatch,
     check_hybrid_leg_imbalance,
     check_knn_counterfactual,
@@ -15,6 +22,7 @@ from lib.rules_engine import (
     check_unindexed_scoring_field,
     check_vocabulary_mismatch,
     evaluated_rule_names,
+    rule_coverage,
     run_all_rules,
 )
 
@@ -37,6 +45,14 @@ def test_missing_keyword_subfield_ignores_non_text_fields():
     mapping = {"price": {"type": "float"}}
     findings = check_missing_keyword_subfield(mapping, ["price"])
     assert findings == []
+
+
+def test_missing_keyword_subfield_ignores_text_child_of_keyword_field():
+    mapping = {
+        "sku": {"type": "keyword", "fields": {"text": {"type": "text"}}},
+        "sku.text": {"type": "text"},
+    }
+    assert check_missing_keyword_subfield(mapping, ["sku.text"]) == []
 
 
 def test_analyzer_mismatch_detects_near_variant():
@@ -72,6 +88,17 @@ def test_analyzer_mismatch_does_not_guess_from_shared_prefix():
         }
     })
     assert findings == []
+
+
+def test_analyzer_mismatch_preserves_case_sensitive_tokens():
+    findings = check_analyzer_mismatch({
+        "code": {
+            "search_tokens": ["abc"],
+            "index_tokens": ["ABC"],
+            "target_tokens": ["ABC"],
+        }
+    })
+    assert len(findings) == 1
 
 
 def test_unindexed_scoring_field_missing_from_mapping():
@@ -146,8 +173,8 @@ def test_weak_knn_recall_requires_measured_rank_improvement():
     findings = check_knn_counterfactual({
         "before_rank": None,
         "after_rank": 4,
-        "before_params": {"embedding.k": 5},
-        "after_params": {"embedding.k": 20},
+        "before_params": {"embedding.ef_search": 20},
+        "after_params": {"embedding.ef_search": 100},
     })
     assert len(findings) == 1
     assert findings[0].tag == "[MODEL_SELECTION]"
@@ -157,6 +184,16 @@ def test_weak_knn_recall_not_inferred_from_score_or_unchanged_rank():
     findings = check_knn_counterfactual({
         "before_rank": None,
         "after_rank": None,
+        "before_params": {"embedding.ef_search": 20},
+        "after_params": {"embedding.ef_search": 100},
+    })
+    assert findings == []
+
+
+def test_weak_knn_recall_rejects_candidate_count_changes():
+    findings = check_knn_counterfactual({
+        "before_rank": None,
+        "after_rank": 4,
         "before_params": {"embedding.k": 5},
         "after_params": {"embedding.k": 20},
     })
@@ -219,3 +256,28 @@ def test_run_all_rules_aggregates_multiple_rules():
 def test_evaluated_rule_names_excludes_rules_without_evidence():
     context = {"summary": parse_explain({"value": 0.1, "description": "sum of:"})}
     assert evaluated_rule_names(context) == []
+
+
+def test_rule_coverage_reports_every_skipped_rule_with_reason():
+    context = {
+        "mapping_properties": {"title": {"type": "text"}},
+        "analysis_by_field": {
+            "title": {
+                "search_tokens": ["running"],
+                "index_tokens": ["run"],
+                "target_tokens": [],
+            }
+        },
+        "summary": parse_explain({"value": 0.1, "description": "sum of:"}),
+    }
+    evaluated, skipped = rule_coverage(context)
+    assert evaluated == []
+    assert set(skipped) == {
+        "missing_keyword_subfield",
+        "analyzer_mismatch",
+        "unindexed_scoring_field",
+        "vocabulary_mismatch",
+        "weak_knn_recall",
+        "hybrid_leg_imbalance",
+    }
+    assert "target-term-vector" in skipped["analyzer_mismatch"]

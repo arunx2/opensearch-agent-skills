@@ -1,4 +1,4 @@
-"""Tests for skills/opensearch-skills/scripts/lib/synonym_suggester.py
+"""Tests for the bundled Relevance X-Ray synonym suggester.
 
 No cluster required — the client-calling helpers (fetch_sample_documents,
 simulate_synonym_analyzer, validate_synonym_candidate) are exercised with a
@@ -8,13 +8,22 @@ fake client object rather than a real OpenSearch connection.
 import sys
 from pathlib import Path
 
-_SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "opensearch-skills" / "scripts"
+_SCRIPTS_DIR = (
+    Path(__file__).resolve().parents[1]
+    / "skills"
+    / "opensearch-skills"
+    / "search"
+    / "relevance-x-ray"
+    / "scripts"
+)
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from lib.synonym_suggester import (
+from relevance_xray_lib.synonym_suggester import (
     SynonymCandidate,
-    fetch_sample_documents,
     analyze_source_document,
+    fetch_document_term_lists,
+    fetch_sample_document_ids,
+    fetch_sample_documents,
     mine_candidate_synonyms,
     rank_delta,
     score_overlap,
@@ -155,8 +164,27 @@ class _FakeClient:
         self._hits = hits
         self.indices = _FakeIndicesClient()
 
-    def search(self, index, body):
+    def search(self, index, body, **kwargs):
+        self.last_search_body = body
         return {"hits": {"hits": self._hits}}
+
+    def mtermvectors(self, index, body, **kwargs):
+        return {
+            "docs": [
+                {
+                    "_id": doc_id,
+                    "term_vectors": {
+                        "title": {
+                            "terms": {
+                                "Sneakers": {},
+                                f"term-{doc_id}": {},
+                            }
+                        }
+                    },
+                }
+                for doc_id in body["ids"]
+            ]
+        }
 
 
 def test_fetch_sample_documents_extracts_source():
@@ -164,6 +192,25 @@ def test_fetch_sample_documents_extracts_source():
     client = _FakeClient(fake_hits)
     docs = fetch_sample_documents(client, "products", fields=["title"], size=10)
     assert docs == [{"title": "Wireless Charger"}, {"title": "Trainers"}]
+    assert "random_score" in client.last_search_body["query"]["function_score"]
+
+
+def test_fetch_sample_document_ids_omits_source_and_uses_random_sample():
+    client = _FakeClient([{"_id": "1"}, {"_id": "2"}])
+    assert fetch_sample_document_ids(client, "products", size=10) == ["1", "2"]
+    assert client.last_search_body["_source"] is False
+    assert client.last_search_body["query"]["function_score"]["random_score"]["seed"]
+
+
+def test_fetch_document_term_lists_batches_ids_and_preserves_order():
+    client = _FakeClient([])
+    terms = fetch_document_term_lists(
+        client,
+        "products",
+        ["2", "1"],
+        ["title"],
+    )
+    assert terms == [["sneakers", "term-2"], ["sneakers", "term-1"]]
 
 
 def test_simulate_synonym_analyzer_returns_tokens():
@@ -201,3 +248,29 @@ def test_validate_synonym_candidate_reports_rank_improvement():
     assert result["before_rank"] is None
     assert result["after_rank"] == 2
     assert result["improved"] is True
+
+
+def test_validate_synonym_candidate_normalizes_document_id_types():
+    client = _FakeClient([])
+
+    def fake_search_fn(client, index, query_text):
+        return [7, 42] if "trainers" in query_text else [42, 7]
+
+    candidate = SynonymCandidate(
+        term="sneakers",
+        candidate="trainers",
+        support=5,
+        confidence=0.5,
+    )
+
+    result = validate_synonym_candidate(
+        client,
+        "products",
+        "sneakers",
+        candidate,
+        target_doc_id="42",
+        search_fn=fake_search_fn,
+    )
+
+    assert result["before_rank"] == 1
+    assert result["after_rank"] == 2

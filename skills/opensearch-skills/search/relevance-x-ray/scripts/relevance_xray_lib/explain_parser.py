@@ -1,4 +1,4 @@
-"""Parse OpenSearch ``_explain`` score trees without losing score semantics.
+"""Parse OpenSearch ``_explain`` trees while preserving score semantics.
 
 The raw explain tree looks like:
 
@@ -40,7 +40,8 @@ _BOOST_RE = re.compile(r"boost of ([\d.]+)", re.IGNORECASE)
 _IDF_HINTS = ("idf, computed as", "inverse document frequency")
 _TF_HINTS = ("tf, computed as", "term frequency")
 _FIELD_NORM_HINTS = ("fieldNorm", "field norm", "avgFieldLength", "fieldLength")
-_HYBRID_HINTS = ("hybrid", "normalization", "combination")
+_HYBRID_HINTS = ("hybrid", "normalization processor", "combination technique")
+MAX_EXPLAIN_DEPTH = 50
 
 
 @dataclass
@@ -73,6 +74,7 @@ class ExplainSummary:
     fields_matched: set[str] = field(default_factory=set)
     fields_referenced_but_unmatched: set[str] = field(default_factory=set)
     root_operation: str | None = None
+    traversal_truncated: bool = False
 
 
 def _categorize(description: str) -> str:
@@ -94,7 +96,7 @@ def _categorize(description: str) -> str:
         return "tf"
     if any(h.lower() in lowered for h in _FIELD_NORM_HINTS):
         return "field_norm"
-    if "boost" in lowered:
+    if _BOOST_RE.search(desc) or lowered.strip() == "boost":
         return "boost"
     if desc.strip() in ("sum of:", "max of:", "product of:"):
         return "combiner"
@@ -121,9 +123,10 @@ def _walk(
     matched_fields: set[str],
     inside_score_clause: bool = False,
     operators: tuple[str, ...] = (),
-) -> None:
+    max_depth: int = MAX_EXPLAIN_DEPTH,
+) -> bool:
     if not isinstance(node, dict):
-        return
+        return False
     value = float(node.get("value", 0.0) or 0.0)
     description = node.get("description", "") or ""
     category = _categorize(description)
@@ -171,8 +174,13 @@ def _walk(
         )
         inside_score_clause = True
 
-    for index, child in enumerate(node.get("details", []) or []):
-        _walk(
+    children = node.get("details", []) or []
+    if depth >= max_depth:
+        return bool(children)
+
+    truncated = False
+    for index, child in enumerate(children):
+        truncated = _walk(
             child,
             depth + 1,
             path + (index,),
@@ -181,7 +189,9 @@ def _walk(
             matched_fields,
             inside_score_clause=inside_score_clause,
             operators=child_operators,
-        )
+            max_depth=max_depth,
+        ) or truncated
+    return truncated
 
 
 def _combine(values: list[float], operation: str | None) -> float | None:
@@ -211,6 +221,8 @@ def _combine_category(
     if not clauses:
         return None
     if len(clauses) == 1:
+        if any(operation != "sum" for operation in clauses[0].operators):
+            return None
         return clauses[0].value
     if not root_operation:
         return None
@@ -219,7 +231,12 @@ def _combine_category(
     return _combine([clause.value for clause in clauses], root_operation)
 
 
-def parse_explain(explain_node: dict, doc_matched: bool | None = None) -> ExplainSummary:
+def parse_explain(
+    explain_node: dict,
+    doc_matched: bool | None = None,
+    *,
+    max_depth: int = MAX_EXPLAIN_DEPTH,
+) -> ExplainSummary:
     """Parse a single document's explain tree into an :class:`ExplainSummary`.
 
     Args:
@@ -242,13 +259,14 @@ def parse_explain(explain_node: dict, doc_matched: bool | None = None) -> Explai
     contributions: list[Contribution] = []
     factors: list[Contribution] = []
     fields_matched: set[str] = set()
-    _walk(
+    traversal_truncated = _walk(
         explain_node,
         0,
         (),
         contributions,
         factors,
         fields_matched,
+        max_depth=max_depth,
     )
 
     knn_scores = [c.value for c in contributions if c.category == "knn"]
@@ -268,6 +286,7 @@ def parse_explain(explain_node: dict, doc_matched: bool | None = None) -> Explai
         is_hybrid=is_hybrid,
         fields_matched=fields_matched,
         root_operation=root_operation,
+        traversal_truncated=traversal_truncated,
     )
 
 

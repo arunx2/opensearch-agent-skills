@@ -1,12 +1,19 @@
-"""Tests for skills/opensearch-skills/scripts/lib/explain_parser.py"""
+"""Tests for the bundled Relevance X-Ray explain parser."""
 
 import sys
 from pathlib import Path
 
-_SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "skills" / "opensearch-skills" / "scripts"
+_SCRIPTS_DIR = (
+    Path(__file__).resolve().parents[1]
+    / "skills"
+    / "opensearch-skills"
+    / "search"
+    / "relevance-x-ray"
+    / "scripts"
+)
 sys.path.insert(0, str(_SCRIPTS_DIR))
 
-from lib.explain_parser import (
+from relevance_xray_lib.explain_parser import (
     missing_query_fields,
     parse_explain,
     to_plain_english,
@@ -152,6 +159,24 @@ def test_non_additive_factors_are_not_ranked_as_contributions():
     assert any("not a separate contribution" in line for line in lines)
 
 
+def test_function_score_max_boost_sentinel_is_not_reported_as_factor():
+    node = {
+        "value": 1.0,
+        "description": "function score, product of:",
+        "details": [
+            _term_match_node("title", "wireless", 1.0),
+            {
+                "value": 3.4028235e38,
+                "description": "maxBoost",
+                "details": [],
+            },
+        ],
+    }
+    summary = parse_explain(node)
+    assert all(factor.description != "maxBoost" for factor in summary.factors)
+    assert "340282" not in "\n".join(to_plain_english(summary))
+
+
 def test_max_combiner_does_not_sum_sibling_scores():
     node = {
         "value": 1.5,
@@ -183,3 +208,27 @@ def test_nested_max_clauses_are_not_described_as_additive():
     assert summary.bm25_score is None
     assert all(c.operators == ("sum", "max") for c in summary.contributions)
     assert all("contributed" not in line for line in to_plain_english(summary))
+
+
+def test_single_clause_under_nested_max_abstains_from_additive_score():
+    node = {
+        "value": 1.5,
+        "description": "sum of:",
+        "details": [{
+            "value": 1.5,
+            "description": "max of:",
+            "details": [_term_match_node("title", "wireless", 1.5)],
+        }],
+    }
+
+    summary = parse_explain(node)
+
+    assert summary.bm25_score is None
+
+
+def test_deep_explain_tree_is_truncated_without_recursion_error():
+    node = _term_match_node("title", "wireless", 1.0)
+    for _ in range(100):
+        node = {"value": 1.0, "description": "sum of:", "details": [node]}
+    summary = parse_explain(node, max_depth=20)
+    assert summary.traversal_truncated is True

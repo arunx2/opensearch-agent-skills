@@ -29,9 +29,9 @@ Given an index, a query, and a document, Relevance X-Ray:
    `.keyword` sub-fields, unavailable doc-value scoring fields, analyzer
    mismatches backed by analyzed tokens/term vectors, measured k-NN recall
    changes, and normalized hybrid output when available.
-4. Optionally mines target-present synonym candidates with document-level
-   support and retains only candidates that improve rank in a controlled
-   query-expansion rerun.
+4. Optionally mines target-present vocabulary candidates from a randomized
+   document sample and retains only candidates that improve rank in a
+   controlled OR query-expansion rerun.
 
 Findings reuse the `[INDEX_MAPPING]` / `[MODEL_SELECTION]` /
 `[SEARCH_PIPELINE]` / `[QUERY_TUNING]` tag vocabulary already established
@@ -40,21 +40,18 @@ by `opensearch-launchpad`'s evaluator, so the two skills read consistently.
 ## Try it
 
 ```bash
-# 1. Start a local cluster (shared script, one directory up)
-bash ../../scripts/start_opensearch.sh
+# 1. Build OpenSearch 3.8.0 and wait for deterministic fixtures
+bash examples/docker/run-demo.sh up
 
-# 2. Load the demo product-catalog index (has a deliberate vocabulary gap)
-bash examples/demo_index_setup.sh
+# 2. Run all end-to-end assertions
+bash examples/docker/run-demo.sh test
 
-# 3. Diagnose why doc 1 ("Lightweight Running Trainers") doesn't show up
-#    for a "sneakers" query
-uv run python ../../scripts/relevance_x_ray.py explain \
-  --index relevance-x-ray-demo --query sneakers --doc-id 1
-
-# 4. Test corpus-supported candidates with a measured target-rank delta
-uv run python ../../scripts/relevance_x_ray.py suggest-synonyms \
-  --index relevance-x-ray-demo --query-term sneakers --doc-id 1
+# 3. Print every example report
+bash examples/docker/run-demo.sh all
 ```
+
+See [demo-playbook.md](demo-playbook.md) for individual analyzer, mapping,
+scoring, synonym, k-NN, hybrid, and abstention cases.
 
 ## Files
 
@@ -62,19 +59,18 @@ uv run python ../../scripts/relevance_x_ray.py suggest-synonyms \
 relevance-x-ray/
   SKILL.md                     Skill manifest (frontmatter + workflow)
   README.md                    This file
+  demo-playbook.md             OpenSearch 3.8 test and presentation guide
+  scripts/
+    relevance_x_ray.py         Standalone CLI entrypoint
+    relevance_xray_lib/        Read-only client and diagnostic modules
   examples/
-    demo_index_setup.sh        Seeds a small sample index for demos
+    demo_index_setup.sh        Seeds an existing cluster
+    seed-demo.sh               Idempotent fixture loader
+    fixtures/                  Mapping, documents, and search pipeline
+    docker/                    Custom image, Compose file, and demo runner
 
-../../scripts/
-  relevance_x_ray.py           CLI entrypoint (preflight-check, inspect-index,
-                                explain, suggest-synonyms)
-  lib/
-    explain_parser.py          Preserves explain operators, clauses, and factors
-    relevance_diagnostics.py   Inspects query DSL and builds counterfactuals
-    rules_engine.py            Anti-pattern detection rules
-    synonym_suggester.py       Candidate synonym mining + validation
-    report.py                  Formats findings into the fixed diagnosis schema
-    client.py                  (existing, shared) connection handling — reused as-is
+../../scripts/relevance_x_ray.py
+                                Compatibility launcher for full-tree installs
 ```
 
 ## Testing
@@ -86,30 +82,31 @@ data, no live cluster required.
 uv run pytest tests/test_agent_skills_explain_parser.py \
               tests/test_agent_skills_relevance_diagnostics.py \
               tests/test_agent_skills_relevance_x_ray.py \
+              tests/test_agent_skills_relevance_x_ray_demo.py \
               tests/test_agent_skills_rules_engine.py \
               tests/test_agent_skills_synonym_suggester.py \
-              tests/test_agent_skills_report.py -v
+              tests/test_agent_skills_report.py \
+              tests/test_agent_skills_query_tuner.py -v
 ```
 
 The thin client-calling functions in `synonym_suggester.py`
-(`fetch_sample_documents`, `simulate_synonym_analyzer`,
+(`fetch_sample_document_ids`, `fetch_document_term_lists`,
 `validate_synonym_candidate`) are tested against a fake client object, not
 a real cluster, matching the pattern used elsewhere in this repo.
 
 ## Design notes / scope for the hackathon build
 
-- Built as an addition to a fork of this repo (not a standalone repo) so a
-  PR back upstream is close to a diff rather than a rewrite, and so it
-  inherits the existing `client.py` connection/auth primitives without
-  allowing diagnostic commands to auto-bootstrap Docker.
+- Bundles its read-only CLI runtime so the leaf works when installed
+  independently. A compatibility launcher preserves the full-tree command.
 - Vendor-neutral: pure OpenSearch REST API calls (`_search`, `_explain`,
-  `_analyze`, `_termvectors`, `_mapping`), no proprietary dependencies.
+  `_analyze`, `_termvectors`, `_mtermvectors`, `_mapping`), no proprietary dependencies.
   Supports endpoints and authentication modes handled by the shared client
   primitives.
-- The synonym miner is a lightweight, dependency-free co-occurrence
+- The vocabulary miner is a lightweight, dependency-free co-occurrence
   heuristic, not an embedding similarity search — this keeps it fully
   unit-testable with no extra ML dependency and no network calls in tests.
-  A future iteration could swap in the vector engine for candidate mining.
+  Its OR-expansion validation is evidence for a candidate experiment, not
+  proof that a production synonym analyzer will produce the same ranking.
 - Scope was deliberately staged: BM25 explain parsing and the anti-pattern
   rules are the baseline-submittable core; hybrid/k-NN leg-splitting and
   the synonym suggester are the stretch layers described in the hackathon
