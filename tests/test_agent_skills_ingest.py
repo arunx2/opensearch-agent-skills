@@ -561,6 +561,24 @@ def test_is_ingestion_running_current_process(workdir):
     assert is_ingestion_running() is True
 
 
+def test_is_ingestion_running_uses_psutil_on_windows(workdir, monkeypatch):
+    pid_path = Path(ingest.PID_FILE)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text("4194304")
+    fake_psutil = type("Psutil", (), {"pid_exists": staticmethod(lambda pid: False)})
+
+    monkeypatch.setattr(ingest, "_IS_WINDOWS", True, raising=False)
+    monkeypatch.setitem(sys.modules, "psutil", fake_psutil)
+    monkeypatch.setattr(
+        ingest.os,
+        "kill",
+        lambda *args: pytest.fail("Windows PID checks must not call os.kill"),
+    )
+
+    assert ingest.is_ingestion_running() is False
+    assert not pid_path.exists()
+
+
 def test_is_ingestion_running_dead_pid(workdir):
     """When PID file contains a dead PID, returns False and cleans up the file."""
     from lib.ingest import is_ingestion_running, PID_FILE

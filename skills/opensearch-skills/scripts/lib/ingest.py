@@ -13,6 +13,8 @@ import tempfile
 import time
 from pathlib import Path
 
+_IS_WINDOWS = os.name == "nt"
+
 
 # ---------------------------------------------------------------------------
 # Page estimation
@@ -547,17 +549,26 @@ def is_ingestion_running() -> bool:
     except (ValueError, OSError):
         return False
 
-    # Check if process is alive (signal 0 doesn't kill, just checks existence).
     try:
-        os.kill(pid, 0)
+        if _IS_WINDOWS:
+            import psutil
+
+            running = psutil.pid_exists(pid)
+        else:
+            # Signal 0 checks existence without sending a signal on POSIX.
+            os.kill(pid, 0)
+            running = True
+    except (ImportError, ProcessLookupError, OSError):
+        running = False
+
+    if running:
         return True
-    except (ProcessLookupError, OSError):
-        # Process is dead — clean up stale PID file.
-        try:
-            pid_path.unlink()
-        except OSError:
-            pass
-        return False
+
+    try:
+        pid_path.unlink()
+    except OSError:
+        pass
+    return False
 
 
 def ingest_background(
