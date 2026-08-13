@@ -53,6 +53,12 @@ def resolve_http_auth() -> tuple[str, str] | None:
                 "OPENSEARCH_PASSWORD."
             )
         return user, password
+    if not _is_local_host(OPENSEARCH_HOST):
+        raise RuntimeError(
+            "Default credentials are only available for local OpenSearch endpoints; "
+            "set OPENSEARCH_AUTH_MODE=custom with OPENSEARCH_USER and "
+            "OPENSEARCH_PASSWORD for a remote endpoint."
+        )
     return _DEFAULT_USER, _DEFAULT_PASSWORD
 
 
@@ -179,6 +185,16 @@ def preflight_check_cluster(
         }
 
     if mode in {"none", "default"}:
+        if mode == "default" and not is_local:
+            return {
+                **result,
+                "status": "auth_required",
+                "message": (
+                    "Default credentials are only available for local OpenSearch "
+                    "endpoints; use auth_mode='custom' for a remote endpoint."
+                ),
+                "auth_modes_tried": [],
+            }
         auth = None if mode == "none" else (_DEFAULT_USER, _DEFAULT_PASSWORD)
         connected, _, attempts = _probe(
             auth,
@@ -225,6 +241,22 @@ def preflight_check_cluster(
             "status": "available",
             "auth_mode": "none",
             "message": f"Connected to OpenSearch at {host}:{port} without authentication.",
+            "auth_modes_tried": attempts,
+        }
+
+    if not is_local:
+        return {
+            **result,
+            "status": "auth_required" if saw_auth_failure else "no_cluster",
+            "message": (
+                (
+                    f"OpenSearch at {host}:{port} requires custom credentials."
+                    if saw_auth_failure
+                    else f"No usable OpenSearch cluster detected at {host}:{port}."
+                )
+                + " This diagnostic skill never sends bundled default credentials "
+                "to remote endpoints."
+            ),
             "auth_modes_tried": attempts,
         }
 
