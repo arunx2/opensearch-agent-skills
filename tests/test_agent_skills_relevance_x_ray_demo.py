@@ -139,6 +139,7 @@ def test_fixture_loader_refuses_remote_reset_without_explicit_override():
     assert "Refusing to reset demo resources on non-loopback endpoint" in loader
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Bash is not part of Windows CI")
 def test_demo_wrapper_rejects_malformed_host_before_building_url():
     env = {
         **os.environ,

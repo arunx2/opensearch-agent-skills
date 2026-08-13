@@ -156,7 +156,18 @@ def test_multimodal_profile_describes_pictures():
 
 def test_ingest_local_records_profile_in_result(workdir):
     pdf = _make_pdf(workdir)
-    with patch.object(ingest, "process_document", return_value=SAMPLE_CHUNKS) as mock_pd:
+    with (
+        patch.object(
+            ingest,
+            "check_memory_available",
+            return_value={"sufficient": True},
+        ),
+        patch.object(
+            ingest,
+            "process_document",
+            return_value=SAMPLE_CHUNKS,
+        ) as mock_pd,
+    ):
         result = ingest_local(str(pdf), profile="tables")
     assert result["profile"] == "tables"
     # process_document must be invoked with the selected profile
@@ -306,7 +317,14 @@ def test_ingest_local_missing_source_returns_error(workdir):
 
 def test_ingest_local_without_index_derives_name(workdir):
     pdf = _make_pdf(workdir)
-    with patch.object(ingest, "process_document", return_value=SAMPLE_CHUNKS):
+    with (
+        patch.object(
+            ingest,
+            "check_memory_available",
+            return_value={"sufficient": True},
+        ),
+        patch.object(ingest, "process_document", return_value=SAMPLE_CHUNKS),
+    ):
         result = ingest_local(str(pdf))  # no index -> derived from filename "doc.pdf"
 
     assert result["status"] == "chunks_ready"
@@ -325,7 +343,14 @@ def test_ingest_local_without_index_derives_name(workdir):
 
 def test_ingest_local_with_index_writes_to_index_dir(workdir):
     pdf = _make_pdf(workdir)
-    with patch.object(ingest, "process_document", return_value=SAMPLE_CHUNKS):
+    with (
+        patch.object(
+            ingest,
+            "check_memory_available",
+            return_value={"sufficient": True},
+        ),
+        patch.object(ingest, "process_document", return_value=SAMPLE_CHUNKS),
+    ):
         result = ingest_local(str(pdf), index_name="attention-paper")
 
     assert result["index"] == "attention-paper"
@@ -337,7 +362,18 @@ def test_ingest_local_with_index_writes_to_index_dir(workdir):
 
 def test_ingest_local_processing_error_is_reported(workdir):
     pdf = _make_pdf(workdir)
-    with patch.object(ingest, "process_document", side_effect=RuntimeError("boom")):
+    with (
+        patch.object(
+            ingest,
+            "check_memory_available",
+            return_value={"sufficient": True},
+        ),
+        patch.object(
+            ingest,
+            "process_document",
+            side_effect=RuntimeError("boom"),
+        ),
+    ):
         result = ingest_local(str(pdf))
     assert "error" in result
     assert "boom" in result["error"]
