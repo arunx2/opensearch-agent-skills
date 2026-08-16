@@ -37,6 +37,13 @@ Findings reuse the `[INDEX_MAPPING]` / `[MODEL_SELECTION]` /
 `[SEARCH_PIPELINE]` / `[QUERY_TUNING]` tag vocabulary already established
 by `opensearch-launchpad`'s evaluator, so the two skills read consistently.
 
+Query tuning preserves the baseline query shape. A `bool` query containing
+`multi_match` can receive field-boost candidates such as `title^2` while
+remaining a `bool` query. `function_score` candidates are proposed only when
+the baseline already uses `function_score`; the skill does not wrap an
+ordinary query in one. A `bool` query composed only of individual `match`
+clauses does not currently receive automatic field-boost candidates.
+
 ## Try it
 
 ```bash
